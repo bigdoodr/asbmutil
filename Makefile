@@ -154,11 +154,11 @@ sign-binaries: swift-build
 	@echo "$(BLUE)Signing binaries...$(NC)"
 	@codesign --force --sign "$(SIGNING_IDENTITY_APP)" \
 		--options runtime --timestamp --entitlements $(ENTITLEMENTS) \
-		--identifier com.github.rodchristiansen.asbmutil \
+		--identifier edu.wku.asbmutil \
 		$(SWIFT_CLI)
 	@codesign --force --sign "$(SIGNING_IDENTITY_APP)" \
 		--options runtime --timestamp --entitlements $(ENTITLEMENTS) \
-		--identifier com.github.rodchristiansen.asbmutil.app \
+		--identifier edu.wku.asbmutil.app \
 		$(SWIFT_APP)
 	@echo "$(GREEN)Binaries signed$(NC)"
 
@@ -173,7 +173,7 @@ create-app-bundle: swift-build compile-icon
 	@# Create Info.plist
 	@/usr/libexec/PlistBuddy -c "Clear dict" $(APP_CONTENTS)/Info.plist 2>/dev/null || true
 	@/usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string $(APP_NAME)" $(APP_CONTENTS)/Info.plist
-	@/usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string com.github.rodchristiansen.asbmutil" $(APP_CONTENTS)/Info.plist
+	@/usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string edu.wku.asbmutil" $(APP_CONTENTS)/Info.plist
 	@/usr/libexec/PlistBuddy -c "Add :CFBundleName string ASBMUtil" $(APP_CONTENTS)/Info.plist
 	@/usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string APPL" $(APP_CONTENTS)/Info.plist
 	@/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $(MARKETING_VERSION)" $(APP_CONTENTS)/Info.plist
@@ -195,6 +195,7 @@ create-app-bundle: swift-build compile-icon
 
 sign-app: create-app-bundle
 	@echo "$(BLUE)Signing app bundle...$(NC)"
+	@xattr -cr $(APP_BUNDLE_PATH)
 	@codesign --force --sign "$(SIGNING_IDENTITY_APP)" \
 		--options runtime --timestamp --deep \
 		$(APP_BUNDLE_PATH)
@@ -252,7 +253,7 @@ create-pkg: create-app-bundle
 		--root $(PKG_STAGING) \
 		--install-location /Applications \
 		--scripts $(PKG_SCRIPTS_DIR) \
-		--identifier com.github.rodchristiansen.asbmutil.pkg \
+		--identifier edu.wku.asbmutil.pkg \
 		--version $(VERSION) \
 		$(PKG_PATH)
 	@rm -rf $(PKG_STAGING)
