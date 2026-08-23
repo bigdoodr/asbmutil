@@ -9,6 +9,7 @@ struct DeviceListView: View {
     @State private var selectedDeviceIDs: Set<String> = []
     @State private var showingInspector = false
     @State private var showFilters = false
+    @State private var includeAppleCareExport = false
 
     private var filters: DeviceFilters { appViewModel.deviceFilters }
 
@@ -47,6 +48,45 @@ struct DeviceListView: View {
                     await appViewModel.loadDevices()
                 }
             }
+            .overlay { appleCareFetchOverlay }
+    }
+
+    // MARK: - AppleCare+ export
+
+    @ViewBuilder
+    private var appleCareFetchOverlay: some View {
+        if appViewModel.isFetchingAppleCare {
+            ZStack {
+                Color.black.opacity(0.25).ignoresSafeArea()
+                VStack(spacing: 12) {
+                    if let progress = appViewModel.appleCareFetchProgress {
+                        ProgressView(value: Double(progress.completed), total: Double(max(progress.total, 1)))
+                            .frame(width: 220)
+                        Text("Fetching AppleCare+ coverage: \(progress.completed)/\(progress.total)")
+                            .font(.callout)
+                    } else {
+                        ProgressView()
+                        Text("Retrying failed lookups...")
+                            .font(.callout)
+                    }
+                }
+                .padding(20)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+            }
+            .transition(.opacity)
+        }
+    }
+
+    private func performAppleCareExport(format: ExportFormat, copyToClipboard: Bool) {
+        Task {
+            let enriched = await appViewModel.fetchAppleCare(for: devicesForExport)
+            guard !enriched.isEmpty else { return }
+            if copyToClipboard {
+                ExportService.copyToClipboard(devices: enriched, format: format)
+            } else {
+                ExportService.export(devices: enriched, format: format)
+            }
+        }
     }
 
     // MARK: - Content
@@ -112,9 +152,18 @@ struct DeviceListView: View {
             }
 
             Menu {
+                Toggle("Include AppleCare+ Coverage", isOn: $includeAppleCareExport)
+                    .help("Fetches coverage from Apple for each exported device — one API call per device, so larger exports take longer.")
+
+                Divider()
+
                 ForEach(ExportFormat.allCases) { fmt in
                     Button {
-                        ExportService.export(devices: devicesForExport, format: fmt)
+                        if includeAppleCareExport {
+                            performAppleCareExport(format: fmt, copyToClipboard: false)
+                        } else {
+                            ExportService.export(devices: devicesForExport, format: fmt)
+                        }
                     } label: {
                         Label(fmt.rawValue, systemImage: fmt.icon)
                     }
@@ -123,7 +172,11 @@ struct DeviceListView: View {
                 Menu("Copy to Clipboard") {
                     ForEach(ExportFormat.allCases) { fmt in
                         Button {
-                            ExportService.copyToClipboard(devices: devicesForExport, format: fmt)
+                            if includeAppleCareExport {
+                                performAppleCareExport(format: fmt, copyToClipboard: true)
+                            } else {
+                                ExportService.copyToClipboard(devices: devicesForExport, format: fmt)
+                            }
                         } label: {
                             Label(fmt.rawValue, systemImage: fmt.icon)
                         }
@@ -132,7 +185,7 @@ struct DeviceListView: View {
             } label: {
                 Label("Export", systemImage: "square.and.arrow.up")
             }
-            .disabled(displayedDevices.isEmpty)
+            .disabled(displayedDevices.isEmpty || appViewModel.isFetchingAppleCare)
 
             Button {
                 Task { await appViewModel.refreshDevices() }

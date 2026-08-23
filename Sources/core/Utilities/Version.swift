@@ -2,5 +2,5 @@
 // Do not edit manually - changes will be overwritten
 
 public enum AppVersion {
-    public static let version = "2026.06.23.1234"
+    public static let version = "2026.08.21.1455"
 }

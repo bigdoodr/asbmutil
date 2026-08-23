@@ -28,6 +28,11 @@ final class AppViewModel {
     // Shared device filter state — survives navigation between sections
     let deviceFilters = DeviceFilters()
 
+    // AppleCare+ export enrichment — ephemeral, scoped to a single export action
+    var isFetchingAppleCare = false
+    var appleCareFetchProgress: (completed: Int, total: Int)?
+    var appleCareFetchError: String?
+
     // Tracks the in-flight per-server count fan-out so we can cancel it on
     // refresh or profile switch and avoid stale results overwriting newer ones.
     private var serverCountsTask: Task<Void, Never>?
@@ -170,5 +175,34 @@ final class AppViewModel {
         guard !Task.isCancelled else { return }
         serverDeviceCounts = counts
         isLoadingServerCounts = false
+    }
+
+    // MARK: - AppleCare+ enrichment (export)
+
+    /// Fetches AppleCare coverage for the given devices, for use by an export action.
+    /// Progress is published via `appleCareFetchProgress` while the fan-out (pass 1) runs;
+    /// the sequential retry pass (pass 2) doesn't report incremental progress, so
+    /// `isFetchingAppleCare` alone covers that phase in the UI.
+    func fetchAppleCare(for devices: [DeviceAttributes]) async -> [DeviceInfo] {
+        guard let client = apiClient else {
+            appleCareFetchError = "Not connected"
+            return []
+        }
+        isFetchingAppleCare = true
+        appleCareFetchProgress = (0, devices.count)
+        appleCareFetchError = nil
+
+        let result = await client.enrichWithAppleCare(
+            devices: devices,
+            onProgress: { [weak self] completed, total in
+                Task { @MainActor in
+                    self?.appleCareFetchProgress = (completed, total)
+                }
+            }
+        )
+
+        isFetchingAppleCare = false
+        appleCareFetchProgress = nil
+        return result
     }
 }

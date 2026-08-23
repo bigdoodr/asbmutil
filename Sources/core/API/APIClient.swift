@@ -773,11 +773,19 @@ public actor APIClient {
     /// parallel pass are retried once more sequentially (concurrency 1). Apple's API uses
     /// HTTP/2 multiplexing over a single TCP connection per host, so higher parallelism means
     /// more server-side stream resets. 4 is the sweet spot for this API.
+    ///
+    /// `onProgress`, if provided, is called as `(completed, total)` after every device is
+    /// resolved (found, none, or failed) during the parallel pass, so a caller can drive a
+    /// determinate progress indicator instead of the CLI's stderr lines (which `showProgress`
+    /// still controls independently — the two can be used together or separately). The
+    /// sequential retry pass doesn't report incremental progress; callers should show an
+    /// indeterminate indicator for that phase if `retryFailedSequentially` is enabled.
     public func enrichWithAppleCare(
         devices: [DeviceAttributes],
         concurrency: Int = 4,
         retryFailedSequentially: Bool = true,
-        showProgress: Bool = false
+        showProgress: Bool = false,
+        onProgress: (@Sendable (Int, Int) -> Void)? = nil
     ) async -> [DeviceInfo] {
         guard !devices.isEmpty else { return [] }
         let cap = max(1, min(concurrency, 32))
@@ -835,6 +843,7 @@ public actor APIClient {
                         Data("  AppleCare: \(completed)/\(total)\n".utf8)
                     )
                 }
+                onProgress?(completed, total)
                 if index < total {
                     let next = devices[index].serialNumber
                     group.addTask { [self] in

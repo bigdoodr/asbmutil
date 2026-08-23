@@ -151,6 +151,18 @@ public struct DeviceInfo: Encodable, Sendable {
     }
 }
 
+public extension DeviceInfo {
+    /// The AppleCare+ coverage entry for this device, if any — deliberately excludes
+    /// Limited Warranty and any other coverage type a device may also carry. Matches on
+    /// `description` containing "AppleCare+" (case-insensitive) to tolerate variants like
+    /// "AppleCare+" and "AppleCare+ for Mac".
+    var appleCarePlus: AppleCareAttributes? {
+        appleCareCoverage?.first {
+            $0.description?.localizedCaseInsensitiveContains("AppleCare+") == true
+        }
+    }
+}
+
 public struct AssignedMdmInfo: Codable, Sendable {
     public let id: String
     public let serverName: String?
