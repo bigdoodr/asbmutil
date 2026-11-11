@@ -13,23 +13,32 @@ public actor APIClient {
     private let creds: Credentials
     private let profileName: String
     private let session: URLSession
+    /// False keeps the access token in memory only, never touching the stored
+    /// credential backend (the Keychain on macOS).
+    private let cachesToken: Bool
 
     // Retry configuration
     private let maxRetries = 3
     private let baseDelaySeconds: Double = 1.0
     private let maxDelaySeconds: Double = 60.0
 
-    public init(credentials: Credentials, profileName: String? = nil) async throws {
+    /// - Parameter cachesToken: When true (the default), the access token is
+    ///   read from and saved to the stored credential backend so later runs
+    ///   reuse it. Pass false for a caller that supplies its own credentials
+    ///   and must not read or write that store; the token then lives only as
+    ///   long as this client.
+    public init(credentials: Credentials, profileName: String? = nil, cachesToken: Bool = true) async throws {
         creds = credentials
-        self.profileName = profileName ?? Keychain.getCurrentProfile()
+        self.cachesToken = cachesToken
+        self.profileName = profileName ?? (cachesToken ? Keychain.getCurrentProfile() : "default")
         self.session = Self.makeSession(for: credentials.scope)
 
         // Try to load a cached token first
-        if let cached = Keychain.loadToken(profileName: self.profileName), !cached.isExpired {
+        if cachesToken, let cached = Keychain.loadToken(profileName: self.profileName), !cached.isExpired {
             token = cached
         } else {
             token = try await Self.fetchToken(creds, session: session)
-            Keychain.saveToken(token, profileName: self.profileName)
+            if cachesToken { Keychain.saveToken(token, profileName: self.profileName) }
         }
     }
 
@@ -264,70 +273,37 @@ public actor APIClient {
     /// default cap is deliberately low. Input order is preserved in each output bucket.
     public func verifyDevices(serials: [String], concurrency: Int = 4) async -> DeviceVerification {
         guard !serials.isEmpty else { return DeviceVerification(found: [], notFound: [], errored: []) }
-        let cap = max(1, min(concurrency, 32))
 
-        // Probe each distinct serial once. Duplicates (from comma input or a CSV with repeats)
-        // would otherwise race in `resultBySerial` — two concurrent probes of the same serial
-        // could overwrite each other, leaving its bucket nondeterministic. We still walk the
-        // original `serials` for output so ordering and any intentional duplicates are preserved.
-        var uniqueSerials: [String] = []
-        var seen = Set<String>()
-        for serial in serials where seen.insert(serial).inserted {
-            uniqueSerials.append(serial)
-        }
-        let total = uniqueSerials.count
-
-        enum Probe: Sendable {
-            case found
-            case notFound
-            case errored(String)
-        }
-
-        var resultBySerial: [String: Probe] = [:]
-
-        await withTaskGroup(of: (String, Probe).self) { group in
-            var index = 0
-
-            func enqueue(_ serial: String) {
-                group.addTask { [self] in
-                    do {
-                        let exists = try await self.deviceExists(serialNumber: serial)
-                        return (serial, exists ? .found : .notFound)
-                    } catch {
-                        return (serial, .errored(error.localizedDescription))
-                    }
-                }
-            }
-
-            while index < cap && index < total {
-                enqueue(uniqueSerials[index])
-                index += 1
-            }
-
-            while let (serial, probe) = await group.next() {
-                resultBySerial[serial] = probe
-                if index < total {
-                    enqueue(uniqueSerials[index])
-                    index += 1
-                }
-            }
+        let results = await fanOut(serials: serials, concurrency: concurrency) { [self] serial in
+            try await self.deviceExists(serialNumber: serial)
         }
 
         var found: [String] = []
         var notFound: [String] = []
         var errored: [(serial: String, message: String)] = []
         for serial in serials {
-            switch resultBySerial[serial] {
-            case .found: found.append(serial)
-            case .notFound: notFound.append(serial)
-            case .errored(let message): errored.append((serial, message))
+            switch results[serial] {
+            case .success(true): found.append(serial)
+            case .success(false): notFound.append(serial)
+            case .failure(let error): errored.append((serial, error.localizedDescription))
             case nil: errored.append((serial, "no result"))
             }
         }
         return DeviceVerification(found: found, notFound: notFound, errored: errored)
     }
 
-    public func createDeviceActivity(activityType: String, serials: [String], serviceId: String) async throws -> ActivityDetails {
+    /// Submit an organization device activity (`POST /v1/orgDeviceActivities`).
+    ///
+    /// `serviceId` is required for the assign/unassign types and ignored for the ones that carry no
+    /// server relationship. `mdmMigrationDeadlineDateTime` (ISO 8601) is required for the two
+    /// deadline-bearing migration types. The string-typed `activityType` overload below keeps the
+    /// original call sites working.
+    public func createDeviceActivity(
+        type: DeviceActivityType,
+        serials: [String],
+        serviceId: String? = nil,
+        mdmMigrationDeadlineDateTime: String? = nil
+    ) async throws -> ActivityDetails {
         struct ActivityResponse: Decodable {
             let data: ActivityData
             struct ActivityData: Decodable {
@@ -343,47 +319,71 @@ public actor APIClient {
             }
         }
 
+        if type.requiresMdmServer && serviceId == nil {
+            throw RuntimeError("\(type.rawValue) requires a device management service ID.")
+        }
+        if type.requiresMigrationDeadline && mdmMigrationDeadlineDateTime == nil {
+            throw RuntimeError("\(type.rawValue) requires a migration deadline (mdmMigrationDeadlineDateTime).")
+        }
+        if type.isBusinessOnly && creds.scope == "school.api" {
+            throw RuntimeError("\(type.rawValue) is an Apple Business API feature (2.4+) and is not available on Apple School Manager tenants. The credential in use (profile '\(profileName)') is a School Manager account.")
+        }
+
         let devices = serials.map { serial in
             ["type": "orgDevices", "id": serial]
+        }
+
+        var attributes: [String: Any] = ["activityType": type.rawValue]
+        if let deadline = mdmMigrationDeadlineDateTime, type.requiresMigrationDeadline {
+            attributes["activityTypeMetadata"] = ["mdmMigrationDeadlineDateTime": deadline]
+        }
+
+        var relationships: [String: Any] = ["devices": ["data": devices]]
+        if let serviceId, type.requiresMdmServer {
+            relationships["mdmServer"] = ["data": ["type": "mdmServers", "id": serviceId]]
         }
 
         let requestBody: [String: Any] = [
             "data": [
                 "type": "orgDeviceActivities",
-                "attributes": [
-                    "activityType": activityType
-                ],
-                "relationships": [
-                    "mdmServer": [
-                        "data": [
-                            "type": "mdmServers",
-                            "id": serviceId
-                        ]
-                    ],
-                    "devices": [
-                        "data": devices
-                    ]
-                ]
+                "attributes": attributes,
+                "relationships": relationships
             ]
         ]
 
         let body = try JSONSerialization.data(withJSONObject: requestBody)
-        let response: ActivityResponse = try await send(
-            Request(
-                method: .POST,
-                path: Endpoints.orgDeviceActivities.path,
-                scope: creds.scope,
-                body: body
+        let response: ActivityResponse
+        do {
+            response = try await send(
+                Request(
+                    method: .POST,
+                    path: Endpoints.orgDeviceActivities.path,
+                    scope: creds.scope,
+                    body: body
+                )
             )
-        )
+        } catch let error as RuntimeError where type.isMigrationType && creds.scope == "school.api" {
+            // Apple lists device management service migration in School Manager API 1.6 (changelog
+            // 2026-08-12) but rolls the release out per tenant; until it lands the School host
+            // rejects the new activity types. An unknown activityType comes back as 409
+            // ENTITY_ERROR.ATTRIBUTE.TYPE (observed live); 400/422 cover other validation shapes.
+            // Say so instead of leaving a bare 4xx.
+            if let code = error.statusCode, [400, 409, 422].contains(code) {
+                throw RuntimeError("\(error.description). \(type.rawValue) is part of Apple School Manager API 1.6, which Apple is still rolling out; this tenant (profile '\(profileName)') may not serve it yet. The same activity works on Apple Business API 2.3+.", statusCode: code)
+            }
+            throw error
+        }
 
         // Get server details for enhanced response
-        let servers = try await listMdmServers()
-        let serverDetails = servers.first { $0.id == serviceId }
+        var serverDetails: MdmServerWithId? = nil
+        if let serviceId, type.requiresMdmServer {
+            let servers = try await listMdmServers()
+            serverDetails = servers.first { $0.id == serviceId }
+        }
 
         return ActivityDetails(
             id: response.data.id,
-            activityType: response.data.attributes.activityType ?? activityType,
+            activityType: response.data.attributes.activityType ?? type.rawValue,
             status: response.data.attributes.status ?? "PENDING",
             createdDateTime: response.data.attributes.createdDateTime ?? "",
             updatedDateTime: response.data.attributes.updatedDateTime ?? "",
@@ -391,8 +391,154 @@ public actor APIClient {
             deviceSerials: serials,
             mdmServerName: serverDetails?.serverName,
             mdmServerType: serverDetails?.serverType,
-            mdmServerId: serviceId
+            mdmServerId: type.requiresMdmServer ? serviceId : nil,
+            mdmMigrationDeadlineDateTime: type.requiresMigrationDeadline ? mdmMigrationDeadlineDateTime : nil
         )
+    }
+
+    /// String-typed overload for the original assign/unassign call sites.
+    public func createDeviceActivity(activityType: String, serials: [String], serviceId: String) async throws -> ActivityDetails {
+        guard let type = DeviceActivityType(rawValue: activityType) else {
+            throw RuntimeError("Unknown activity type '\(activityType)'. Expected one of: \(DeviceActivityType.allCases.map(\.rawValue).joined(separator: ", ")).")
+        }
+        return try await createDeviceActivity(type: type, serials: serials, serviceId: serviceId)
+    }
+
+    // MARK: - Device Management Service Migration (API 1.6 School / 2.3 Business)
+
+    /// Assign devices to a device management service and schedule a no-erase migration that must
+    /// complete by `deadline` (ISO 8601, at most 90 days out). Devices stay enrolled in their current
+    /// service until they migrate; Apple prompts users and enforces the deadline on-device.
+    public func scheduleMdmMigration(serials: [String], serviceId: String, deadline: String) async throws -> ActivityDetails {
+        try await createDeviceActivity(
+            type: .assignDevicesWithMdmMigrationDeadline,
+            serials: serials,
+            serviceId: serviceId,
+            mdmMigrationDeadlineDateTime: deadline
+        )
+    }
+
+    /// Move the deadline of an in-progress migration. Serials with no migration pending are reported
+    /// as failures in the activity log rather than rejected up front.
+    public func updateMdmMigrationDeadline(serials: [String], deadline: String) async throws -> ActivityDetails {
+        try await createDeviceActivity(
+            type: .updateMdmMigrationDeadline,
+            serials: serials,
+            mdmMigrationDeadlineDateTime: deadline
+        )
+    }
+
+    /// Cancel an in-progress migration for each serial.
+    public func cancelMdmMigration(serials: [String]) async throws -> ActivityDetails {
+        try await createDeviceActivity(type: .cancelMdmMigration, serials: serials)
+    }
+
+    /// Read each serial's migration eligibility, state and deadline from `GET /v1/orgDevices/{serial}`.
+    ///
+    /// One request per serial, fanned out with bounded concurrency; input order is preserved. A
+    /// serial that cannot be read yields a record with `error` set instead of failing the batch.
+    public func mdmMigrationStatus(serials: [String], concurrency: Int = 4) async -> [MdmMigrationRecord] {
+        let results = await fanOut(serials: serials, concurrency: concurrency) { [self] serial in
+            try await self.getDeviceAttributes(serialNumber: serial)
+        }
+
+        return serials.map { serial in
+            switch results[serial] {
+            case .success(let device):
+                return MdmMigrationRecord(device: device)
+            case .failure(let error):
+                return MdmMigrationRecord(serialNumber: serial, isMdmMigrationCapable: nil, mdmMigrationStatus: nil, mdmMigrationDeadlineDateTime: nil, status: nil, deviceManagementServiceId: nil, error: error.localizedDescription)
+            case nil:
+                return MdmMigrationRecord(serialNumber: serial, isMdmMigrationCapable: nil, mdmMigrationStatus: nil, mdmMigrationDeadlineDateTime: nil, status: nil, deviceManagementServiceId: nil, error: "no result")
+            }
+        }
+    }
+
+    /// Re-read each device and reconcile its migration state against the intended end state.
+    ///
+    /// `.scheduled(deadline:)` expects an active migration (REQUESTED or STARTED) whose deadline
+    /// matches the one submitted; a device that already reports SUCCESS also counts. `.cancelled`
+    /// expects no active migration.
+    public func confirmMdmMigration(serials: [String], expected: MigrationExpectation, concurrency: Int = 4) async -> MigrationReconciliation {
+        let records = await mdmMigrationStatus(serials: serials, concurrency: concurrency)
+        var asExpected: [MdmMigrationRecord] = []
+        var mismatched: [MdmMigrationRecord] = []
+        var errored: [(serial: String, message: String)] = []
+
+        for record in records {
+            if let error = record.error {
+                errored.append((record.serialNumber, error))
+                continue
+            }
+            let matches: Bool
+            switch expected {
+            case .scheduled(let deadline):
+                let state = MdmMigrationStatus(rawValue: record.mdmMigrationStatus ?? "")
+                let stateOK = state?.isActive == true || state == .success
+                let deadlineOK = Self.sameInstant(record.mdmMigrationDeadlineDateTime, deadline)
+                matches = stateOK && (state == .success || deadlineOK)
+            case .cancelled:
+                matches = !record.hasActiveMigration
+            }
+            if matches { asExpected.append(record) } else { mismatched.append(record) }
+        }
+
+        return MigrationReconciliation(asExpected: asExpected, mismatched: mismatched, errored: errored)
+    }
+
+    /// Compare two ISO 8601 timestamps by instant so `17:00:00Z` and `17:00:00.000Z` agree.
+    /// Falls back to string equality when either side doesn't parse.
+    private static func sameInstant(_ a: String?, _ b: String) -> Bool {
+        guard let a else { return false }
+        if let da = parseISO8601(a), let db = parseISO8601(b) {
+            return abs(da.timeIntervalSince(db)) < 1
+        }
+        return a == b
+    }
+
+    /// Parse an ISO 8601 timestamp with or without fractional seconds.
+    public static func parseISO8601(_ s: String) -> Date? {
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = withFraction.date(from: s) { return d }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: s)
+    }
+
+    // MARK: - Release Devices (API 2.4 Business)
+
+    /// Release devices from the organization. Irreversible: the devices drop out of the org, lose
+    /// their enrollment assignment, and are removed from Blueprints and the built-in service.
+    /// Apple Business only; School tenants are refused before any request is sent.
+    public func releaseDevices(serials: [String]) async throws -> ActivityDetails {
+        try await createDeviceActivity(type: .releaseDevices, serials: serials)
+    }
+
+    /// Re-read each serial after a release settled. A released device reads back as HTTP 404 or
+    /// carries `releasedFromOrgDateTime`; anything else is still present.
+    public func confirmRelease(serials: [String], concurrency: Int = 4) async -> ReleaseReconciliation {
+        let results = await fanOut(serials: serials, concurrency: concurrency) { [self] serial -> Bool in
+            do {
+                let device = try await self.getDeviceAttributes(serialNumber: serial)
+                return device.releasedFromOrgDateTime != nil
+            } catch let error as RuntimeError where error.statusCode == 404 {
+                return true
+            }
+        }
+
+        var released: [String] = []
+        var present: [String] = []
+        var errored: [(serial: String, message: String)] = []
+        for serial in serials {
+            switch results[serial] {
+            case .success(true): released.append(serial)
+            case .success(false): present.append(serial)
+            case .failure(let error): errored.append((serial, error.localizedDescription))
+            case nil: errored.append((serial, "no result"))
+            }
+        }
+        return ReleaseReconciliation(released: released, stillPresent: present, errored: errored)
     }
 
     /// List all device activities (assignment history) from the tenant.
@@ -537,49 +683,17 @@ public actor APIClient {
         concurrency: Int = 4
     ) async -> AssignmentReconciliation {
         guard !serials.isEmpty else { return AssignmentReconciliation(asExpected: [], mismatched: [], errored: []) }
-        let cap = max(1, min(concurrency, 32))
-        let total = serials.count
 
-        enum Outcome: Sendable {
-            case assignedServer(String?)   // current server id, nil if unassigned
-            case errored(String)
-        }
-
-        var outcomeBySerial: [String: Outcome] = [:]
-
-        await withTaskGroup(of: (String, Outcome).self) { group in
-            var index = 0
-
-            func enqueue(_ serial: String) {
-                group.addTask { [self] in
-                    do {
-                        let response = try await self.getAssignedMdmRaw(deviceId: serial)
-                        return (serial, .assignedServer(response.data?.id))
-                    } catch {
-                        return (serial, .errored(error.localizedDescription))
-                    }
-                }
-            }
-
-            while index < cap && index < total {
-                enqueue(serials[index])
-                index += 1
-            }
-            while let (serial, outcome) = await group.next() {
-                outcomeBySerial[serial] = outcome
-                if index < total {
-                    enqueue(serials[index])
-                    index += 1
-                }
-            }
+        let results = await fanOut(serials: serials, concurrency: concurrency) { [self] serial -> String? in
+            try await self.getAssignedMdmRaw(deviceId: serial).data?.id
         }
 
         var asExpected: [String] = []
         var mismatched: [(serial: String, assignedTo: String?)] = []
         var errored: [(serial: String, message: String)] = []
         for serial in serials {
-            switch outcomeBySerial[serial] {
-            case .assignedServer(let current):
+            switch results[serial] {
+            case .success(let current):
                 let matches: Bool
                 switch expected {
                 case .assigned(let serverId): matches = (current == serverId)
@@ -590,8 +704,8 @@ public actor APIClient {
                 } else {
                     mismatched.append((serial, current))
                 }
-            case .errored(let message):
-                errored.append((serial, message))
+            case .failure(let error):
+                errored.append((serial, error.localizedDescription))
             case nil:
                 errored.append((serial, "no result"))
             }
@@ -697,8 +811,9 @@ public actor APIClient {
 
     // MARK: - Get Device by Serial
 
-    /// Get a single device's full attributes by serial number
-    public func getDevice(serialNumber: String) async throws -> DeviceInfo {
+    /// Read a single device's attributes by serial number (`GET /v1/orgDevices/{serial}`), with no
+    /// AppleCare or assigned-server follow-up calls.
+    public func getDeviceAttributes(serialNumber: String) async throws -> DeviceAttributes {
         struct SingleDeviceResponse: Decodable {
             let data: DeviceData
         }
@@ -710,6 +825,12 @@ public actor APIClient {
                 body: nil
             )
         )
+        return response.data.attributes
+    }
+
+    /// Get a single device's full attributes by serial number
+    public func getDevice(serialNumber: String) async throws -> DeviceInfo {
+        let attributes = try await getDeviceAttributes(serialNumber: serialNumber)
 
         // Fetch AppleCare coverage (non-fatal if it fails)
         var coverages: [AppleCareAttributes]? = nil
@@ -738,7 +859,7 @@ public actor APIClient {
         }
 
         return DeviceInfo(
-            device: response.data.attributes,
+            device: attributes,
             appleCareCoverage: coverages,
             assignedMdm: mdmInfo
         )
@@ -761,6 +882,47 @@ public actor APIClient {
             deviceSerialNumber: deviceSerialNumber,
             coverages: response.data.map(\.attributes)
         )
+    }
+
+    // MARK: - Activation Lock Status
+
+    /// Read a device's Activation Lock state and kind
+    /// (`GET /v1/orgDevices/{serial}/activationLockStatus`).
+    ///
+    /// Returns nil when Apple will not report the state: the read fails with a server
+    /// error for a device carrying an internal-only lock state. That is "unknown", never
+    /// "unlocked", so callers must not read nil as disabled. Other failures throw.
+    public func getActivationLockStatus(serialNumber: String) async throws -> ActivationLockStatus? {
+        struct Response: Decodable {
+            struct DataItem: Decodable {
+                struct Attributes: Decodable {
+                    let isLocked: Bool?
+                    let lockType: String?
+                }
+                let attributes: Attributes
+            }
+            let data: DataItem
+        }
+        do {
+            let response: Response = try await send(
+                Request(
+                    method: .GET,
+                    path: Endpoints.activationLockStatus(serialNumber).path,
+                    scope: creds.scope,
+                    body: nil
+                )
+            )
+            return ActivationLockStatus(
+                deviceSerialNumber: serialNumber,
+                isLocked: response.data.attributes.isLocked ?? false,
+                lockType: response.data.attributes.lockType
+            )
+        } catch let error as RuntimeError {
+            if let status = error.statusCode, (500...599).contains(status) {
+                return nil
+            }
+            throw error
+        }
     }
 
     /// Fan out per-device AppleCare coverage lookups with bounded concurrency.
@@ -933,11 +1095,115 @@ public actor APIClient {
         }
     }
 
+    // MARK: - Audit Events (API 2.0)
+
+    /// Query organization audit events within a time range, following cursor pagination.
+    ///
+    /// `startTimestamp`/`endTimestamp` are required by Apple and must be ISO8601 UTC (e.g.
+    /// `2026-06-01T00:00:00Z`). Apple supports only a single `type`, `subjectId`, and `actorId`
+    /// per query, so each is a scalar filter. Pass `type` (e.g. `DEVICE_ASSIGNED_TO_SERVER`) to
+    /// scope to one event kind — the basis for migration verification. `eventsPerPage` controls
+    /// page size (Apple max 1000); `totalLimit` caps the events returned across all pages.
+    public func listAuditEvents(
+        startTimestamp: String,
+        endTimestamp: String,
+        type: String? = nil,
+        subjectId: String? = nil,
+        actorId: String? = nil,
+        eventsPerPage: Int? = nil,
+        totalLimit: Int? = nil
+    ) async throws -> [AuditEventRecord] {
+        // Audit Events is an Apple Business API feature (2.0+). The Apple School Manager API
+        // (1.x) does not expose it, so the request 404s ("PATH_ERROR: The resource
+        // 'v1/auditEvents' does not exist") on a School tenant. Fail early with a clear message
+        // rather than surfacing a confusing not-found from the server.
+        guard creds.scope != "school.api" else {
+            throw RuntimeError("Audit Events is an Apple Business API feature (2.0+) and is not available on Apple School Manager tenants. The credential in use (profile '\(profileName)') is a School Manager account, so GET /v1/auditEvents returns 404. Use an Apple Business Manager API key to query audit events.")
+        }
+
+        var out: [AuditEventRecord] = []
+        var cursor: String? = nil
+        var page = 0
+        let maxPages = 1000
+
+        repeat {
+            if page >= maxPages {
+                throw RuntimeError("listAuditEvents: pagination exceeded \(maxPages) pages; results would be truncated at \(out.count) events.")
+            }
+            let path = auditEventsPath(
+                start: startTimestamp,
+                end: endTimestamp,
+                type: type,
+                subjectId: subjectId,
+                actorId: actorId,
+                limit: eventsPerPage,
+                cursor: cursor
+            )
+            let response: AuditEventsResponse = try await send(
+                Request(method: .GET, path: path, scope: creds.scope, body: nil)
+            )
+            out += response.data.map(AuditEventRecord.init(from:))
+
+            if let totalLimit, out.count >= totalLimit {
+                return Array(out.prefix(totalLimit))
+            }
+
+            cursor = response.meta?.paging.nextCursor ?? Self.cursor(fromNextLink: response.links?.next)
+            page += 1
+            if cursor != nil {
+                try await Task.sleep(nanoseconds: 100_000_000) // 0.1s courtesy delay, matching listDevices
+            }
+        } while cursor != nil
+
+        return out
+    }
+
+    /// Build the `/v1/auditEvents` path with its filter query, fully percent-encoded.
+    ///
+    /// Both the bracketed filter keys (`filter[startTimestamp]` → `filter%5BstartTimestamp%5D`) and
+    /// the values are encoded here. This matters because `send()` re-parses the path with
+    /// `URL(string:)`: if that string contains any character it must encode (e.g. a literal `[`),
+    /// the parser re-encodes the whole query component — turning our already-encoded `%2B` into
+    /// `%252B` (double encoding). Handing it a fully-valid string sidesteps that, and pre-encoding
+    /// values keeps cursor tokens with `+`, `/`, or `=` intact (a raw `+` would otherwise reach the
+    /// server as a space).
+    private func auditEventsPath(
+        start: String,
+        end: String,
+        type: String?,
+        subjectId: String?,
+        actorId: String?,
+        limit: Int?,
+        cursor: String?
+    ) -> String {
+        let valueAllowed = CharacterSet.urlQueryAllowed.subtracting(.init(charactersIn: "+&=?#[]/"))
+        func enc(_ s: String) -> String { s.addingPercentEncoding(withAllowedCharacters: valueAllowed) ?? s }
+        func encKey(_ s: String) -> String { s.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? s }
+        var pairs: [(String, String)] = [
+            ("filter[startTimestamp]", start),
+            ("filter[endTimestamp]", end),
+        ]
+        if let type { pairs.append(("filter[type]", type)) }
+        if let subjectId { pairs.append(("filter[subjectId]", subjectId)) }
+        if let actorId { pairs.append(("filter[actorId]", actorId)) }
+        if let limit { pairs.append(("limit", String(limit))) }
+        if let cursor { pairs.append(("cursor", cursor)) }
+        let query = pairs.map { "\(encKey($0.0))=\(enc($0.1))" }.joined(separator: "&")
+        return Endpoints.auditEvents.path + "?" + query
+    }
+
+    /// Extract the `cursor` query parameter from a paging `links.next` URL, for the deployments
+    /// that paginate via `links` rather than `meta.paging.nextCursor`.
+    private static func cursor(fromNextLink link: String?) -> String? {
+        guard let link, let comps = URLComponents(string: link) else { return nil }
+        return comps.queryItems?.first(where: { $0.name == "cursor" })?.value
+    }
+
     /// Refresh the access token if the cached one has expired.
     private func ensureValidToken() async throws {
         if token.isExpired {
             token = try await Self.fetchToken(creds, session: session)
-            Keychain.saveToken(token, profileName: profileName)
+            if cachesToken { Keychain.saveToken(token, profileName: profileName) }
         }
     }
 
@@ -972,7 +1238,7 @@ public actor APIClient {
         )
         FileHandle.standardError.write(data)
         FileHandle.standardError.write(Data("\n".utf8))
-        throw RuntimeError("HTTP error \(http.statusCode)")
+        throw RuntimeError("HTTP error \(http.statusCode)", statusCode: http.statusCode)
     }
 
     /// Execute a request with retry/backoff and return the final response.
@@ -1058,16 +1324,95 @@ public actor APIClient {
         return min(delay, maxDelaySeconds)
     }
 
+    /// Whether an error is a transport-level failure worth retrying on a fresh connection.
+    ///
+    /// Besides the obvious connectivity codes, this covers HTTP/2 stream failures. On Linux,
+    /// URLSession rides libcurl and multiplexes concurrent requests over one HTTP/2 connection;
+    /// when a stream dies (`PROTOCOL_ERROR`, or the server sending a `transfer-encoding: chunked`
+    /// header that HTTP/2 forbids) every stream in flight on that connection fails with it. Those
+    /// surface as `URLError` codes that are not network codes, or as foreign error types with the
+    /// curl message in the description, so match on both. A retry after backoff lands on a new
+    /// connection.
     private func isNetworkError(_ error: Error) -> Bool {
         if let urlError = error as? URLError {
             switch urlError.code {
-            case .timedOut, .cannotConnectToHost, .networkConnectionLost, .notConnectedToInternet:
+            case .timedOut, .cannotConnectToHost, .networkConnectionLost, .notConnectedToInternet,
+                 .cannotFindHost, .dnsLookupFailed, .secureConnectionFailed,
+                 .badServerResponse, .cannotParseResponse, .unknown:
                 return true
             default:
-                return false
+                break
             }
         }
-        return false
+        let text = "\(error) \(error.localizedDescription)"
+        let markers = ["HTTP/2", "PROTOCOL_ERROR", "Invalid HTTP header", "stream", "connection reset", "Connection reset", "Empty reply", "transfer closed"]
+        return markers.contains { text.contains($0) }
+    }
+
+    // MARK: - Fan-out helper
+
+    /// Run `operation` once per distinct serial with bounded concurrency, then retry any serial
+    /// that failed, sequentially, before reporting it as an error.
+    ///
+    /// Two passes because a single transport failure can take down every request sharing a
+    /// connection (see `isNetworkError`); the per-request retry inside `send` handles most of it,
+    /// and the sequential pass mops up the rest on a quiet connection. Results are keyed by
+    /// serial; callers walk their own input order so duplicates and ordering are preserved.
+    private func fanOut<T: Sendable>(
+        serials: [String],
+        concurrency: Int,
+        retryFailedSequentially: Bool = true,
+        operation: @escaping @Sendable (String) async throws -> T
+    ) async -> [String: Result<T, Error>] {
+        var uniqueSerials: [String] = []
+        var seen = Set<String>()
+        for serial in serials where seen.insert(serial).inserted {
+            uniqueSerials.append(serial)
+        }
+        guard !uniqueSerials.isEmpty else { return [:] }
+        let cap = max(1, min(concurrency, 32))
+        let total = uniqueSerials.count
+
+        var results: [String: Result<T, Error>] = [:]
+
+        await withTaskGroup(of: (String, Result<T, Error>).self) { group in
+            var index = 0
+            func enqueue(_ serial: String) {
+                group.addTask {
+                    do {
+                        return (serial, .success(try await operation(serial)))
+                    } catch {
+                        return (serial, .failure(error))
+                    }
+                }
+            }
+            while index < cap && index < total {
+                enqueue(uniqueSerials[index])
+                index += 1
+            }
+            while let (serial, result) = await group.next() {
+                results[serial] = result
+                if index < total {
+                    enqueue(uniqueSerials[index])
+                    index += 1
+                }
+            }
+        }
+
+        guard retryFailedSequentially else { return results }
+
+        let failed = uniqueSerials.filter {
+            if case .failure(let error) = results[$0] { return isNetworkError(error) }
+            return false
+        }
+        for serial in failed {
+            do {
+                results[serial] = .success(try await operation(serial))
+            } catch {
+                results[serial] = .failure(error)
+            }
+        }
+        return results
     }
 
     private static func fetchToken(_ c: Credentials,

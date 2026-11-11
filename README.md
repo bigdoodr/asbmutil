@@ -19,6 +19,10 @@ Get devices info, assign/unassign MDM servers, and resolve device-to-server assi
 * StrictConcurrency enabled
 * Bulk device-to-server resolution via server-side device listing (4-5 API calls regardless of fleet size)
 * Bulk AppleCare enrichment for whole fleets via `list-devices --include-applecare` (two-pass fan-out, no CSV required)
+* **NEW**: Activation Lock state via `activation-lock` — whether each device is locked, and whether it is an MDM lock (bypass code escrowed) or a user lock (needs the owner)
+* **NEW (API 1.6 School / 2.3 Business)**: Headless device management service migration — `assign --migration-deadline` schedules a no-erase MDM migration with a deadline, `update-migration-deadline` moves it, `cancel-migration` stops it, and `migration-status` reads each device's `isMdmMigrationCapable` / `mdmMigrationStatus` / `mdmMigrationDeadlineDateTime`
+* **NEW (API 2.4, Apple Business Manager only)**: `release-devices` removes devices from the organization
+* **NEW (API 2.0, Apple Business Manager only)**: Organization audit events via `audit-events` — query device/server moves and other org changes by time range and type (e.g. migration verification via `DEVICE_ASSIGNED_TO_SERVER`), in the CLI and the app's Audit Events view
 * **NEW (API 1.5)**: MAC addresses support multiple values (array format) for devices with multiple network interfaces
 * **NEW (API 1.4)**: Wi-Fi, Bluetooth, and built-in Ethernet MAC addresses for macOS
 * **NEW (API 1.3)**: AppleCare coverage lookup for devices (single-serial via `get-devices-info`, whole-fleet via `list-devices --include-applecare`)
@@ -186,6 +190,80 @@ For organizations managing multiple ABM instances, you can create named profiles
 
 # Activity Status
 ./asbmutil batch-status 361c8b76-55c6-4d07-9c1a-2ea9755c34e3
+
+# Device Management Service Migration (API 1.6 School / 2.3 Business)
+./asbmutil assign --csv-file devices.csv --mdm "Intune" --migration-deadline 2026-10-01T17:00:00Z            # Schedule a no-erase migration
+./asbmutil assign --csv-file devices.csv --mdm "Intune" --migration-deadline 2026-10-01T17:00:00Z --confirm  # ...and verify each device reports it
+./asbmutil update-migration-deadline --csv-file devices.csv --deadline 2026-09-15T17:00:00Z                 # Move the deadline
+./asbmutil update-migration-deadline --serials P8R2K47NF5X9 --deadline 2026-01-01T00:00:00Z --allow-past    # Force the migration now
+./asbmutil cancel-migration --serials P8R2K47NF5X9,Q7M5V83WH4L2
+./asbmutil migration-status --csv-file devices.csv
+
+# Release Devices (API 2.4, Apple Business Manager only; irreversible)
+./asbmutil release-devices --serials P8R2K47NF5X9 --yes
+./asbmutil release-devices --csv-file retired.csv --yes --confirm
+```
+
+### Device management service migration (API 1.6 School / 2.3 Business)
+
+Apple's 2026-08-12 release lets you change a device's device management service without erasing it, with a deadline the device enforces on its own: the user is prompted, can defer until the deadline, and is then migrated. Until now this could only be scheduled in the web UI; the same `orgDeviceActivities` endpoint now takes three more activity types, so it runs headlessly here.
+
+`assign --migration-deadline <ISO 8601 UTC>` submits `ASSIGN_DEVICES_WITH_MDM_MIGRATION_DEADLINE` instead of a plain `ASSIGN_DEVICES`. The deadline must be in the future and no more than 90 days out; the tool rejects anything else before calling Apple. Pre-flight verification and `--confirm` work the same way as a plain assign, except that confirmation re-reads each device's migration fields and expects a pending migration (`REQUESTED` or `STARTED`) with the submitted deadline.
+
+```bash
+./asbmutil assign --csv-file devices.csv --mdm "Intune" --migration-deadline 2026-10-01T17:00:00Z --confirm
+```
+
+`update-migration-deadline` takes the same serial inputs and a `--deadline`. An earlier deadline is honored immediately; a past one forces the migration now with no option to delay, which is why it needs `--allow-past`. `cancel-migration` stops an in-progress migration. For both, a serial with no migration pending is reported as a failure in Apple's activity log rather than rejected up front, so use `--confirm` (or `batch-status`) when it matters.
+
+```bash
+./asbmutil cancel-migration --csv-file devices.csv --confirm
+```
+
+`migration-status` reads `GET /v1/orgDevices/{serial}` for each serial and prints `isMdmMigrationCapable`, `mdmMigrationStatus` (`REQUESTED`, `STARTED`, `SUCCESS`, `FAILED`), `mdmMigrationDeadlineDateTime`, plus the assignment status and service ID. The same three fields also appear on every device in `list-devices` and `get-devices-info`, and in the app's device detail and exports.
+
+The app has the same operations. The Assignments section and the multi-select inspector offer Migrate, Update Deadline and Cancel Migration alongside Assign and Unassign, with a date picker that shows the exact UTC timestamp being sent and refuses past or over-90-day deadlines. A device's detail view offers Migrate by Deadline when Apple reports it eligible, and Update Deadline / Cancel Migration when a migration is pending. The Devices table gains a sortable Migration column and a Migration filter (status, or Eligible / Not eligible), which is the quickest way to find `FAILED` and `REQUESTED` stragglers across a fleet.
+
+```bash
+./asbmutil migration-status --csv-file devices.csv
+```
+
+> **Rollout note.** Apple's changelog lists this under Apple School Manager API 1.6 and Apple Business API 2.3, both dated 2026-08-12. Live-verified on 2026-09-02 against a School Manager tenant: the three device fields are served and `CANCEL_MDM_MIGRATION` was accepted and completed, even though parts of Apple's School documentation still carry the 1.5 banner. If a tenant has not received the release yet, the new activity types come back as a 4xx; the tool explains that instead of leaving a bare HTTP error, and `migration-status` reports when no device returned any migration field.
+
+### Activation Lock
+
+`activation-lock` reads `/v1/orgDevices/{serial}/activationLockStatus` for each serial and reports `enabled`, `disabled` or `unknown`, with `lockType` naming the kind of lock: `MDM`, for which a bypass code is escrowed so clearing it does not need the owner, or `USER`, which does. Apple serves this one device per request and fails the read with a server error for a device reporting an internal-only lock state; that is reported as `unknown`, never as `disabled`. The command only reports state — it never reads a bypass code, and neither Apple service exposes a way to clear a lock.
+
+```bash
+./asbmutil activation-lock --serials SERIAL1,SERIAL2
+```
+
+### Release devices (API 2.4, Apple Business Manager only)
+
+`release-devices` submits `RELEASE_DEVICES`, which removes devices from the organization permanently: enrollment assignments are removed, devices are unenrolled from the built-in device management service and dropped from Blueprints. It requires `--yes`, runs the same pre-flight serial verification as `assign`, and with `--confirm` re-reads each serial afterwards, treating an HTTP 404 or a set `releasedFromOrgDateTime` as released. The Apple School Manager API does not offer this activity (the School host rejects it with 409 `ENTITY_ERROR.ATTRIBUTE.TYPE`), so the command refuses to run against a School Manager credential. In the app, Release appears as an operation only when the active profile is a Business Manager credential, and requires ticking an acknowledgement before the button enables.
+
+```bash
+./asbmutil release-devices --csv-file retired.csv --yes --confirm
+```
+
+### Audit Events (API 2.0)
+
+`audit-events` queries the organization audit log over a time range. `--start` and `--end` are required ISO8601 UTC timestamps; results are emitted as a flattened JSON array (device serial and target server are pulled out of the matching event data) on stdout, with a count on stderr. Apple accepts only one `--type`, `--subject-id`, and `--actor-id` per query.
+
+> **Apple Business Manager only.** Audit Events is part of the Apple Business API (2.0+). The Apple School Manager API (1.x) does not expose this endpoint, so running `audit-events` against a School Manager credential fails fast with a clear message instead of the server's raw 404 `PATH_ERROR`.
+
+The primary use is migration verification: after reassigning devices, confirm each move actually landed by pulling `DEVICE_ASSIGNED_TO_SERVER` events for the window.
+
+```bash
+./asbmutil audit-events --start 2026-06-01T00:00:00Z --end 2026-06-14T23:59:59Z
+```
+
+```bash
+./asbmutil audit-events --start 2026-06-01T00:00:00Z --end 2026-06-14T23:59:59Z --type DEVICE_ASSIGNED_TO_SERVER
+```
+
+```bash
+./asbmutil audit-events --start 2026-06-01T00:00:00Z --end 2026-06-14T23:59:59Z --subject-id P8R2K47NF5X9
 ```
 
 ## Profile System
@@ -676,6 +754,14 @@ Tips for very large fleets:
 * Reduce `--devices-per-page` (try `500` or `250`) — smaller pages return faster and are less likely to hit the per-request timeout.
 * Combine with `--show-pagination` to see live progress on stderr.
 * `--include-applecare` can be combined with `--resume`: resume covers the device-listing stage, AppleCare enrichment then runs on the completed list, and the state files are only cleared once enrichment and output finish successfully.
+
+## Apple API coverage
+
+[`docs/apple-api/COVERAGE.md`](docs/apple-api/COVERAGE.md) lists every endpoint Apple documents for the School Manager and Business APIs and whether asbmutil implements it. A weekly workflow compares Apple's published docs against that record and opens an `apple-api` issue when a new release lands. To run the same check locally:
+
+```bash
+scripts/apple-api-watch.py check
+```
 
 ## Requirements
 
