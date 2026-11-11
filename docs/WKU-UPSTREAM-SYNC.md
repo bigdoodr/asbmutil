@@ -64,8 +64,9 @@ Needs git 2.40+ (`git merge-tree --write-tree`).
 
 ## Things to know
 
-- Releases come from the existing `release.yml`, which builds **unsigned** artifacts. Signing and
-  notarization (`make build`) are still a local step.
+- Releases come from the existing `release.yml`, which builds **unsigned** artifacts. The separate
+  [Signed Release](WKU-SIGNED-RELEASES.md) workflow then replaces the macOS assets with signed,
+  notarized ones.
 - `scripts/` is bundled into the `.pkg` as installer scripts, which is why the sync tooling lives in `tools/`.
 - Upstream's `apple-api-watch.yml` arrives with the first sync and will open "Apple API changes to
   review" issues on this fork each week. Delete or disable it in the sync PR if you don't want them.
